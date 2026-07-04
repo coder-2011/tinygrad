@@ -219,8 +219,8 @@ pm_to_program = PatternMatcher([
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, name="lin")), name="prg"), do_render),
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
 ])
-# linearize+estimates only, BEAM uses this to sort candidates by uop count before compiling
-pm_to_program_linearized = PatternMatcher(pm_to_program.patterns[:2])
+# everything except compile, BEAM uses this to sort candidates by uop count before compiling
+pm_to_program_nocompile = PatternMatcher(pm_to_program.patterns[:4])
 
 @track_rewrites(name=lambda ast,renderer,ret,**kwargs: TracingKey(ret.src[0].arg.name,(ret.src[0].arg.function_name, ast), ret=renderer), replay=True)
 @Context(ALLOW_DEVICE_USAGE=0)

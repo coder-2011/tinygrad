@@ -1,13 +1,13 @@
-import math, time, multiprocessing, traceback, signal, atexit
+import math, time, multiprocessing, traceback, signal, atexit, itertools
 from dataclasses import replace
-from tinygrad.uop.ops import sym_infer, AxisType, UOp
+from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored, time_to_str
 from tinygrad.helpers import IGNORE_BEAM_CACHE
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
-from tinygrad.codegen import do_to_program, pm_to_program_linearized
+from tinygrad.codegen import do_to_program, pm_to_program_nocompile
 from tinygrad.codegen.opt.postrange import Scheduler
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(8)]
@@ -54,7 +54,7 @@ def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
   raise TimeoutException()
 
-def _try_compile(x:tuple) -> tuple[int, tuple[UOp, float]|None]:
+def _try_compile(x:tuple) -> tuple[int, tuple|None]:
   if hasattr(signal, "alarm"):
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
@@ -63,15 +63,15 @@ def _try_compile(x:tuple) -> tuple[int, tuple[UOp, float]|None]:
   try:
     st = time.perf_counter()
     if isinstance(x[1], Scheduler):
-      # linearize pass: (i, Scheduler) -> (prg, et), stops before render/compile so beam_search can order the compiles
-      prg = do_to_program(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren, pm=pm_to_program_linearized)
+      # render pass: (i, Scheduler) -> (prg, et), stops before compile so beam_search can order the compiles
+      prg = do_to_program(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren, pm=pm_to_program_nocompile)
       uops = prg.src[1].src
       if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
         if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
         raise RuntimeError("too many uops")
       ret = (prg, time.perf_counter() - st)
-    # render/compile pass: (i, linearized prg, renderer, linearize et) -> (prg, et)
-    else: ret = (do_to_program(x[1], x[2]), x[3] + time.perf_counter() - st)
+    # compile pass: (i, source, compiler, render et) -> (lib, et), only the source/binary cross the process boundary
+    else: ret = (x[2].compile_cached(x[1]), x[3] + time.perf_counter() - st)
   except RuntimeError:
     if DEBUG >= 4: traceback.print_exc()
   except Exception as e:
@@ -127,7 +127,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
 
   default_parallel = multiprocessing.cpu_count() if s.ren.target.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
-    # 32 since each candidate is now two tasks (linearize + render/compile), keeps the respawn rate of 16 with fused tasks
+    # 32 since each candidate is now two tasks (render + compile), keeps the respawn rate of 16 with fused tasks
     beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 32))
     @atexit.register
     def close_pool(): beam_pool.close()
@@ -146,15 +146,19 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     while not exiting:
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       worker = map if beam_pool is None else beam_pool.imap_unordered
-      # linearize everything first, then dispatch the compiles longest (most uops) first so a slow compile doesn't straggle at the end of the round
+      # render everything first, then dispatch the compiles longest (most uops) first so a slow compile doesn't straggle at the end of the round
       lins = sorted([(i, *proc) for i, proc in worker(_try_compile, enumerate(candidates)) if proc is not None],
                     key=lambda x: (-len(x[1].src[1].src), x[0]))
+      prgs = {i:prg for i, prg, _ in lins}
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
-      for i, proc in worker(_try_compile, [(i, prg, candidates[i].ren, et) for i, prg, et in lins]):
+      # isa renderers already assembled a BINARY in the render pass, everything else compiles its SOURCE here
+      for i, proc in itertools.chain([(i, (prg.src[3].arg, et)) for i, prg, et in lins if len(prg.src) > 3],
+          worker(_try_compile, [(i, prg.src[2].arg, candidates[i].ren.compiler, et) for i, prg, et in lins if len(prg.src) == 3])):
         if proc is None: continue
-        prg, compile_et = proc
-        if (lib:=prg.src[3].arg) in seen_libs: continue
+        lib, compile_et = proc
+        if lib in seen_libs: continue
+        prg = prgs[i] if len(prgs[i].src) > 3 else prgs[i].replace(src=prgs[i].src+(UOp(Ops.BINARY, arg=lib),))
         # filter out kernels that use 1000x more compute than the smallest
         estimates = prg.src[0].arg.estimates
         least_compute_ops = min(this_compute_ops:=sym_infer(estimates.ops if estimates is not None else 0, var_vals), least_compute_ops)
