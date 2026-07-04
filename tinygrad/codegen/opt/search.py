@@ -7,7 +7,7 @@ from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, di
 from tinygrad.helpers import IGNORE_BEAM_CACHE
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
-from tinygrad.codegen import to_program, to_program_linearized
+from tinygrad.codegen import do_to_program, pm_to_program_linearized
 from tinygrad.codegen.opt.postrange import Scheduler
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(8)]
@@ -54,37 +54,31 @@ def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
   raise TimeoutException()
 
-def _try_fxn(i:int, fxn):
+def _try_compile(x:tuple) -> tuple[int, tuple[UOp, float]|None]:
   if hasattr(signal, "alarm"):
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
     signal.alarm(getenv("BEAM_TIMEOUT_SEC", 10))
+  ret = None
   try:
-    return i, fxn()
+    st = time.perf_counter()
+    if isinstance(x[1], Scheduler):
+      # linearize pass: (i, Scheduler) -> (prg, et), stops before render/compile so beam_search can order the compiles
+      prg = do_to_program(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren, pm=pm_to_program_linearized)
+      uops = prg.src[1].src
+      if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
+        if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
+        raise RuntimeError("too many uops")
+      ret = (prg, time.perf_counter() - st)
+    # render/compile pass: (i, linearized prg, renderer, linearize et) -> (prg, et)
+    else: ret = (do_to_program(x[1], x[2]), x[3] + time.perf_counter() - st)
   except RuntimeError:
     if DEBUG >= 4: traceback.print_exc()
   except Exception as e:
     if getenv("BEAM_STRICT_MODE"): raise e
   finally:
     if hasattr(signal, "alarm"): signal.alarm(0)
-  return i, None
-
-def _try_linearize(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, int, float]|None]:
-  def fxn():
-    st = time.perf_counter()
-    prg = to_program_linearized(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren)
-    uops = prg.src[1].src
-    if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
-      if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
-      raise RuntimeError("too many uops")
-    return prg, len(uops), time.perf_counter() - st
-  return _try_fxn(x[0], fxn)
-
-def _try_compile(x) -> tuple[int, tuple[UOp, float]|None]:
-  def fxn():
-    st = time.perf_counter()
-    return to_program(x[1], x[2]), x[3] + time.perf_counter() - st
-  return _try_fxn(x[0], fxn)
+  return x[0], ret
 
 # workers should not open devices and should ignore ctrl c and should not launch VIZ
 def _init_worker():
@@ -151,11 +145,12 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     while not exiting:
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       worker = map if beam_pool is None else beam_pool.imap_unordered
-      prepared = [(i, *proc) for i, proc in worker(_try_linearize, enumerate(candidates)) if proc is not None]
-      prepared.sort(key=lambda x: (-x[2], x[0]))
+      # linearize everything first, then dispatch the compiles longest (most uops) first so a slow compile doesn't straggle at the end of the round
+      lins = sorted([(i, *proc) for i, proc in worker(_try_compile, enumerate(candidates)) if proc is not None],
+                    key=lambda x: (-len(x[1].src[1].src), x[0]))
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
-      for i, proc in worker(_try_compile, ((i, prg, candidates[i].ren, et) for i, prg, _, et in prepared)):
+      for i, proc in worker(_try_compile, [(i, prg, candidates[i].ren, et) for i, prg, et in lins]):
         if proc is None: continue
         prg, compile_et = proc
         if (lib:=prg.src[3].arg) in seen_libs: continue
