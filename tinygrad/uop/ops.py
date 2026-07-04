@@ -99,8 +99,9 @@ class UOpMetaClass(type):
   ucache:dict[tuple, weakref.ReferenceType[UOp]] = {}
   def __call__(cls, op:Ops, dtype:DType=dtypes.void, src:tuple[UOp,...]=tuple(), arg:Any=None, tag:Any=None,
                metadata:tuple[Metadata,...]|None=None, _buffer:Buffer|None=None):
-    if (wret:=UOpMetaClass.ucache.get(key:=(op, dtype, src, arg, tag), None)) is not None and (ret:=wret()) is not None: return ret
-    UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(*key))
+    ucache = UOpMetaClass.ucache
+    if (wret:=ucache.get(key:=(op, dtype, src, arg, tag), None)) is not None and (ret:=wret()) is not None: return ret
+    ucache[key] = weakref.ref(created:=super().__call__(*key))
     if metadata is not None: all_metadata[created] = metadata
     # NOTE: this value is set by pickle when pickling a realized tensor
     if _buffer is not None:
@@ -1335,6 +1336,7 @@ def upat_deferred_compile(p:UPat, fxn:Callable, entry:list) -> Callable:
   return lazy_compile
 
 class PatternMatcher:
+  __slots__ = ("patterns", "pdict")
   def __init__(self, patterns:Sequence[tuple[UPat, Callable|tuple]], compiled=bool(getenv("UPAT_COMPILE", 1))):
     # if this comes from a pickle, we reconstruct the lambda functions here
     self.patterns:list[tuple[UPat, Callable]] = [(p,types.FunctionType(*fxn) if isinstance(fxn, tuple) else fxn) for p,fxn in patterns]
@@ -1343,7 +1345,7 @@ class PatternMatcher:
     # uop is required, arg is optional
     for p,fxn in self.patterns:
       assert p.op is not None
-      entry: list = [p, None, p.early_reject]
+      entry: list = [p, None, p.early_reject or None]
       entry[1] = upat_deferred_compile(p, fxn, entry) if compiled else upat_interpret(p, fxn)
       for uop in p.op: self.pdict.setdefault(uop, []).append(entry)
 
@@ -1353,10 +1355,12 @@ class PatternMatcher:
   def __add__(self, more:PatternMatcher) -> PatternMatcher: return PatternMatcher(self.patterns+more.patterns)
 
   def rewrite(self, uop:UOp, ctx=None):
-    if len(pats:=self.pdict.get(uop.op, [])):
-      if (ler:=uop.__dict__.get('_src_ops')) is None: uop.__dict__['_src_ops'] = ler = {u.op for u in uop.src}
+    if pats:=self.pdict.get(uop.op):
+      ler = None
       for _,match,early_reject in pats:
-        if not early_reject.issubset(ler): continue
+        if early_reject is not None:
+          if ler is None and (ler:=uop.__dict__.get('_src_ops')) is None: uop.__dict__['_src_ops'] = ler = {u.op for u in uop.src}
+          if not early_reject.issubset(ler): continue
         if (ret:=match(uop, ctx)) is not None and ret is not uop: return ret
     return None
 
@@ -1449,13 +1453,13 @@ def profile_matches(fxn:Callable):
 
 class TrackedPatternMatcher(PatternMatcher):
   def rewrite(self, uop:UOp, ctx=None):
-    if len(pats:=self.pdict.get(uop.op, [])):
+    if pats:=self.pdict.get(uop.op):
       ret = None
       ler = {u.op for u in uop.src}
       for p,match,early_reject in pats:
         if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
         st = time.perf_counter()
-        if not early_reject.issubset(ler):
+        if early_reject is not None and not early_reject.issubset(ler):
           match_stats[p][2] += time.perf_counter()-st
           continue
         match_stats[p][1] += 1
@@ -1515,6 +1519,7 @@ if TRACK_MATCH_STATS or PROFILE:
 SENTINEL: Final[UOp] = cast(UOp, object())
 class BottomUpGate(Exception): pass
 class RewriteContext:
+  __slots__ = ("pm", "bpm", "bpm_cache", "ctx", "replace", "enter_calls")
   def __init__(self, pm, bpm, ctx=None, enter_calls=False):
     self.pm: PatternMatcher|None = pm
     self.bpm: PatternMatcher|None = bpm
@@ -1544,7 +1549,7 @@ class RewriteContext:
           continue
         # no rewrite, process children then come back to rebuild
         stack.append((n, True))
-        if not self.enter_calls and n.op in {Ops.CALL, Ops.FUNCTION}: self.replace[n.src[0]] = n.src[0]
+        if not self.enter_calls and (n.op is Ops.CALL or n.op is Ops.FUNCTION): self.replace[n.src[0]] = n.src[0]
         for x in reversed(n.src):
           if x not in self.replace: stack.append((x, False))
       else:
@@ -1560,13 +1565,16 @@ class RewriteContext:
     stack: collections.deque[tuple[UOp, int, UOp]] = collections.deque([(root, 0, root)])
     on_stack = {root}  # all UOps either on the stack or in self.replace, i.e. dont have to be placed again
     waitlist: dict[UOp, list[tuple[UOp, int, UOp]]] = {}  # UOps waiting on a dependency to be in self.replace
+    replace, ctx, stack_limit, enter_calls = self.replace, self.ctx, REWRITE_STACK_LIMIT.value, self.enter_calls
+    bpm, cached_bpm_rewrite = self.bpm, self.cached_bpm_rewrite
+    pm_rewrite = self.pm.rewrite if self.pm is not None else None
     while stack:
-      if len(stack) > REWRITE_STACK_LIMIT: raise RuntimeError("infinite loop in graph_rewrite (stack too big)")
+      if len(stack) > stack_limit: raise RuntimeError("infinite loop in graph_rewrite (stack too big)")
       n, stage, new_n = stack.pop()
-      if n in self.replace: continue  # skip any nodes we have seen
+      if n in replace: continue  # skip any nodes we have seen
       if stage == 0:
         # if bottom up, we rewrite this node early. in both cases, we add its srcs to the stack
-        if self.bpm is not None:
+        if bpm is not None:
           # apply rewrite rules until a fixed point is reached. may return `uop` itself if PatternMatcher doesn't match
           test_n: UOp|None = n
           seen = set()
@@ -1574,17 +1582,17 @@ class RewriteContext:
             while test_n is not None:
               if test_n in seen: raise RuntimeError("infinite loop in fixed_point_rewrite")
               seen.add(test_n)
-              new_n, test_n = test_n, self.cached_bpm_rewrite(test_n)
+              new_n, test_n = test_n, cached_bpm_rewrite(test_n)
           except BottomUpGate:
             # if the bpm matching raised a gate, we are done with this node and dont continue down the srcs
-            self.replace[n] = unwrap(test_n)
+            replace[n] = unwrap(test_n)
             if n in waitlist: stack.extend(waitlist.pop(n))
             continue
         stack.append((n, 1, new_n))
         # NOTE: CALL/FUNCTION are handled as a special case.
         # The function that is called is not included in the graph_rewrite.
         # If you want to graph_rewrite a call, you can
-        if not self.enter_calls and new_n.op in {Ops.CALL, Ops.FUNCTION}: self.replace[new_n.src[0]] = new_n.src[0]
+        if not enter_calls and (new_n.op is Ops.CALL or new_n.op is Ops.FUNCTION): replace[new_n.src[0]] = new_n.src[0]
         for x in reversed(new_n.src):
           if x in on_stack: continue
           stack.append((x, 0, x))
@@ -1592,7 +1600,7 @@ class RewriteContext:
       elif stage == 1:
         tmp = []
         for x in new_n.src:
-          if (rx:=self.replace.get(x, SENTINEL)) is SENTINEL:
+          if (rx:=replace.get(x, SENTINEL)) is SENTINEL:
             # source not ready: register in waitlist instead of spinning
             waitlist.setdefault(x, []).append((n, 1, new_n))
             break
@@ -1601,8 +1609,8 @@ class RewriteContext:
           # in stage 1, once all srcs are rewritten, rebuild (if changed) or run top-down rewrite
           if (new_src:=tuple(tmp)) == new_n.src:
             # if top down, do the rewrite. if no rewrite or bottom up, we are done rewriting this node so we add it to the dict
-            if self.pm is None or (new_src_n:=self.pm_rewrite(new_n)) is None:
-              self.replace[n] = new_n
+            if pm_rewrite is None or (new_src_n:=pm_rewrite(new_n, ctx)) is None:
+              replace[n] = new_n
               if n in waitlist: stack.extend(waitlist.pop(n))
               continue
           else:
@@ -1613,14 +1621,14 @@ class RewriteContext:
           stack.append((new_src_n, 0, new_src_n))
       else:
         # in stage 2, we link the result of new_n to the result of n
-        if (replaced_new_n:=self.replace.get(new_n, SENTINEL)) is SENTINEL:
+        if (replaced_new_n:=replace.get(new_n, SENTINEL)) is SENTINEL:
           # not ready: register in waitlist instead of spinning
           waitlist.setdefault(new_n, []).append((n, 2, new_n))
         else:
           # otherwise we are done
-          self.replace[n] = replaced_new_n
+          replace[n] = replaced_new_n
           if n in waitlist: stack.extend(waitlist.pop(n))
-    return self.replace[root]
+    return replace[root]
 
 @profile_matches
 def graph_rewrite(sink:UOp, pm:PatternMatcher, ctx=None, bottom_up=False, name=None, bpm=None, walk=False, enter_calls=False) -> UOp:
