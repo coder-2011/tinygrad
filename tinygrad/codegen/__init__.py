@@ -219,10 +219,12 @@ pm_to_program = PatternMatcher([
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, name="lin")), name="prg"), do_render),
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
 ])
+# everything except compile, BEAM uses this to sort candidates by uop count before compiling
+pm_to_program_nocompile = PatternMatcher(pm_to_program.patterns[:4])
 
 @track_rewrites(name=lambda ast,renderer,ret,**kwargs: TracingKey(ret.src[0].arg.name,(ret.src[0].arg.function_name, ast), ret=renderer), replay=True)
 @Context(ALLOW_DEVICE_USAGE=0)
-def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
+def do_to_program(ast:UOp, renderer:Renderer, pm:PatternMatcher=pm_to_program) -> UOp:
   """
   Transform an AST into a compiled PROGRAM. May trigger BEAM search.
 
@@ -245,7 +247,7 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     prg = UOp(Ops.PROGRAM, src=(full_sink,), arg=prog_info)
   else: raise RuntimeError(f"can't call to_program on {ast.op}")
   if not isinstance(prg.arg, ProgramInfo): prg = prg.replace(arg=ProgramInfo.from_sink(prg.src[0]))
-  prg = graph_rewrite(prg, pm_to_program, ctx=renderer, name="linearize/render")
+  prg = graph_rewrite(prg, pm, ctx=renderer, name="linearize/render")
   if VIZ: graph_rewrite(prg, PatternMatcher([]), name="View Program")
   return prg
 
