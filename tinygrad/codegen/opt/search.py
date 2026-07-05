@@ -1,10 +1,10 @@
 import math, time, multiprocessing, traceback, signal, atexit
 from dataclasses import replace
-from tinygrad.uop.ops import sym_infer, AxisType, UOp
+from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored, time_to_str
-from tinygrad.helpers import IGNORE_BEAM_CACHE
+from tinygrad.helpers import IGNORE_BEAM_CACHE, USE_TC
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
 from tinygrad.codegen import to_program
@@ -122,6 +122,17 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
 
+  seeds: list[Scheduler] = []
+  if not any(u.op is Ops.STAGE for u in s.ast.backward_slice):
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    for tc in (tcs:=[USE_TC.value]):
+      with Context(TC=tc): r = hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]
+      if tc and r and r[0].op is OptOps.TC: tcs.append(0)
+      sq = s
+      for i,o in enumerate(r):
+        sq = sq.copy()
+        sq.apply_opt(o)
+        if i or o not in actions: seeds.append(sq)
   default_parallel = multiprocessing.cpu_count() if s.ren.target.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
     beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
@@ -140,7 +151,8 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     exiting, st = False, time.perf_counter()
     dev = Device[s.ren.target.device]
     while not exiting:
-      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
+      candidates: list[Scheduler] = seeds + flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
+      seeds = []
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
       for i, proc in ((map if beam_pool is None else beam_pool.imap_unordered)(_try_compile, enumerate(candidates))):
