@@ -4,7 +4,7 @@ from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored, time_to_str
-from tinygrad.helpers import IGNORE_BEAM_CACHE
+from tinygrad.helpers import IGNORE_BEAM_CACHE, USE_TC
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
 from tinygrad.codegen import to_program
@@ -122,13 +122,20 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
 
-  # seed the first round with every prefix of hand_coded_optimizations, so the search can branch off the heuristic path at any depth
+  # seed round 1 with every prefix of hand_coded_optimizations (with and without TC), so the search can branch off the heuristic path at any depth
   seeds: list[Scheduler] = []
   if not any(u.op is Ops.STAGE for u in s.ast.backward_slice):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
-    for o in hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]:
-      seeds.append((seeds[-1] if seeds else s).copy())
-      seeds[-1].apply_opt(o)
+    recipes: list[list[Opt]] = []
+    for tc in dict.fromkeys([USE_TC.value, 0]):
+      with Context(TC=tc):
+        if (r:=hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]) and r not in recipes: recipes.append(r)
+    for r in recipes:
+      sq = s
+      for o in r:
+        sq = sq.copy()
+        sq.apply_opt(o)
+        seeds.append(sq)
     # single-opt prefixes that are already round-1 actions would just be duplicate compiles
     seeds = [sq for sq in seeds if len(sq.applied_opts) > len(s.applied_opts)+1 or sq.applied_opts[-1] not in actions]
 
