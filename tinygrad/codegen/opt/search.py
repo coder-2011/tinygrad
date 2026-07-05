@@ -122,23 +122,17 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
 
-  # seed round 1 with every prefix of hand_coded_optimizations (with and without TC), so the search can branch off the heuristic path at any depth
   seeds: list[Scheduler] = []
   if not any(u.op is Ops.STAGE for u in s.ast.backward_slice):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
-    recipes: list[list[Opt]] = []
-    for tc in dict.fromkeys([USE_TC.value, 0]):
-      with Context(TC=tc):
-        if (r:=hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]) and r not in recipes: recipes.append(r)
-    for r in recipes:
+    for tc in (tcs:=[USE_TC.value]):
+      with Context(TC=tc): r = hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]
+      if tc and r and r[0].op is OptOps.TC: tcs.append(0)
       sq = s
-      for o in r:
+      for i,o in enumerate(r):
         sq = sq.copy()
         sq.apply_opt(o)
-        seeds.append(sq)
-    # single-opt prefixes that are already round-1 actions would just be duplicate compiles
-    seeds = [sq for sq in seeds if len(sq.applied_opts) > len(s.applied_opts)+1 or sq.applied_opts[-1] not in actions]
-
+        if i or o not in actions: seeds.append(sq)
   default_parallel = multiprocessing.cpu_count() if s.ren.target.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
     beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
