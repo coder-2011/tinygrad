@@ -129,6 +129,8 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     for o in hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]:
       seeds.append((seeds[-1] if seeds else s).copy())
       seeds[-1].apply_opt(o)
+    # single-opt prefixes that are already round-1 actions would just be duplicate compiles
+    seeds = [sq for sq in seeds if len(sq.applied_opts) > len(s.applied_opts)+1 or sq.applied_opts[-1] not in actions]
 
   default_parallel = multiprocessing.cpu_count() if s.ren.target.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
@@ -148,7 +150,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     exiting, st = False, time.perf_counter()
     dev = Device[s.ren.target.device]
     while not exiting:
-      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam]) + seeds
+      candidates: list[Scheduler] = seeds + flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       seeds = []
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
