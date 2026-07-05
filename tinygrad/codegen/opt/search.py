@@ -1,6 +1,6 @@
 import math, time, multiprocessing, traceback, signal, atexit
 from dataclasses import replace
-from tinygrad.uop.ops import sym_infer, AxisType, UOp
+from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored, time_to_str
@@ -122,6 +122,17 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
 
+  # seed the first round with every prefix of hand_coded_optimizations, so the search can branch off the heuristic path at any depth
+  seeds: list[Scheduler] = []
+  if not any(u.op is Ops.STAGE for u in s.ast.backward_slice):
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    sq = s
+    for o in hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]:
+      sq = sq.copy()
+      try: sq.apply_opt(o)
+      except KernelOptError: break
+      seeds.append(sq)
+
   default_parallel = multiprocessing.cpu_count() if s.ren.target.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
     beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
@@ -140,7 +151,8 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
     exiting, st = False, time.perf_counter()
     dev = Device[s.ren.target.device]
     while not exiting:
-      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
+      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam]) + seeds
+      seeds = []
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
       for i, proc in ((map if beam_pool is None else beam_pool.imap_unordered)(_try_compile, enumerate(candidates))):
