@@ -126,12 +126,9 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   seeds: list[Scheduler] = []
   if not any(u.op is Ops.STAGE for u in s.ast.backward_slice):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
-    sq = s
     for o in hand_coded_optimizations(s.copy()).applied_opts[len(s.applied_opts):]:
-      sq = sq.copy()
-      try: sq.apply_opt(o)
-      except KernelOptError: break
-      seeds.append(sq)
+      seeds.append((seeds[-1] if seeds else s).copy())
+      seeds[-1].apply_opt(o)
 
   default_parallel = multiprocessing.cpu_count() if s.ren.target.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
