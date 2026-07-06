@@ -89,7 +89,7 @@ def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_
 # get dictionary of all possible actions
 def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dict[int, Scheduler]:
   acted, max_up, max_lcl = {0:s} if include_0 else {}, getenv("BEAM_UPCAST_MAX", 256) if max_up is None else max_up, getenv("BEAM_LOCAL_MAX", 1024)
-  kernel_actions = actions + ([Opt(OptOps.CACHE, slot, policy) for slot in range(8) for policy in range(1,5)] if s.ren.suffix == "PTX" and
+  kernel_actions = actions + ([Opt(OptOps.CACHE, slot, policy) for slot in range(8) for policy in range(1, len(cache_opts))] if (cache_opts:=getattr(s.ren, "cache_opts", ())) and
     s.ren.target.interface != "MOCK" and (AxisType.REDUCE not in s.axis_types or any(o.op is OptOps.UNROLL for o in s.applied_opts)) else [])
 
   for i,a in enumerate(kernel_actions):
