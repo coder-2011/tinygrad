@@ -1,7 +1,7 @@
 from typing import cast, Callable
 import struct
 from collections import defaultdict
-from tinygrad.codegen.opt import OptOps, tc
+from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, GroupOp
 from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.renderer import Renderer
@@ -174,7 +174,7 @@ class PTXRenderer(Renderer):
 
     c: defaultdict[str, int] = defaultdict(int)
     r: dict[UOp, list[str]|str] = {}
-    self.cache = {o.axis:o.arg for o in uops[-1].arg.applied_opts if o.op is OptOps.CACHE}
+    self.cache = {o.axis:o.arg for o in uops[-1].arg.applied_opts if o.op.name == "CACHE"}
     self.r = r
     self.uops = uops
 
