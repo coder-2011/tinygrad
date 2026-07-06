@@ -57,8 +57,7 @@ ptx_matcher = PatternMatcher([
 ])
 
 def mem_type(ctx:"PTXRenderer", x:UOp, st=False) -> str:
-  c = ctx.cache.get(x.src[0].buf_uop.arg.slot, "")
-  return 'shared' if x.addrspace == AddrSpace.LOCAL else 'global' + ("" if c == (".nc" if st else ".wt") else c)
+  return 'shared' if x.addrspace == AddrSpace.LOCAL else 'global' + (((("", ".L1::evict_last", ".L1::evict_first", "", ".wt") if st else ("", ".L1::evict_last.L2::128B", ".L2::64B", ".L2::256B", "")) if int(ctx.target.arch[3:]) >= 80 else ("", ".cg", ".cs", ".nc", ".wt"))[ctx.cache.get(x.src[0].buf_uop.arg.slot, 0)])
 def mem_load(ctx:"PTXRenderer", x:UOp, loc:UOp) -> str:
   return f"ld.{mem_type(ctx, loc)}" + \
     f"{f'.v{x.max_numel()}' if x.max_numel() > 1 else ''}.{ctx.mem_types[x.dtype.scalar()]} " + \
@@ -175,7 +174,7 @@ class PTXRenderer(Renderer):
 
     c: defaultdict[str, int] = defaultdict(int)
     r: dict[UOp, list[str]|str] = {}
-    self.cache = {o.axis:(".cg", ".cs", ".nc", ".wt")[o.arg-1] for o in uops[-1].arg.applied_opts if o.op is OptOps.CACHE}
+    self.cache = {o.axis:o.arg for o in uops[-1].arg.applied_opts if o.op is OptOps.CACHE}
     self.r = r
     self.uops = uops
 
