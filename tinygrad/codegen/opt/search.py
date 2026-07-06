@@ -87,12 +87,13 @@ def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_
 # *** external API ***
 
 # get dictionary of all possible actions
-def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dict[int, Scheduler]:
+def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None, cache=False) -> dict[int, Scheduler]:
+  if cache and (not (cache_opts:=getattr(s.ren, "cache_opts", ())) or s.ren.target.interface == "MOCK"): return {}
   acted, max_up, max_lcl = {0:s} if include_0 else {}, getenv("BEAM_UPCAST_MAX", 256) if max_up is None else max_up, getenv("BEAM_LOCAL_MAX", 1024)
-  kernel_actions = actions.copy()
+  kernel_actions = actions if not cache else [Opt(OptOps.CACHE, slot, policy) for slot in range(8) for policy in range(1, len(cache_opts))]
 
   for i,a in enumerate(kernel_actions):
-    if a.axis is not None and a.op is not OptOps.TC:
+    if a.axis is not None and a.op not in {OptOps.TC, OptOps.CACHE}:
       try: ax = s.real_axis(a.op, a.axis)
       except KernelOptError: continue
       if (ax >= s.shape_len) or (s.full_shape[ax] == a.arg and Opt(a.op, a.axis, 0) in kernel_actions): continue
@@ -137,10 +138,11 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
   try:
     rawbufs = _ensure_buffer_alloc(rawbufs)
     var_vals: dict[str, int] = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
-    exiting, st = False, time.perf_counter()
+    exiting, cache, cacheable, st = False, False, getattr(s.ren, "cache_opts", ()) and s.ren.target.interface != "MOCK", time.perf_counter()
     dev = Device[s.ren.target.device]
-    while not exiting:
-      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
+    while not exiting or (cacheable and not cache):
+      if exiting: cache, exiting, seen_libs, beam = True, False, set(), [(si, float("inf")) for si,_ in beam]
+      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=cache, cache=cache).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
       for i, proc in ((map if beam_pool is None else beam_pool.imap_unordered)(_try_compile, enumerate(candidates))):
@@ -154,14 +156,14 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
           if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
           continue
         seen_libs.add(lib)
-        try: tms = _time_program(prg, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
+        try: tms = _time_program(prg, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0, cnt=7 if cache else 3,
                                  allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
                                  dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
         except Exception as e:
           if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
           if isinstance(e, RuntimeError): continue
           raise
-        timed.append((candidates[i], min(tms)))
+        timed.append((candidates[i], sorted(tms)[len(tms)//2] if cache else min(tms)))
         if BEAM_DEBUG > 1:
           print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(prg.src[1].src):5d} uops",
                 f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",

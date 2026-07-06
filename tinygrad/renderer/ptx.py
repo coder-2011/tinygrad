@@ -56,7 +56,11 @@ ptx_matcher = PatternMatcher([
   (UPat.var("x") >> UPat.var("y"), lambda x,y: UOp(Ops.SHR, x.dtype, (x,y.cast(dtypes.uint))) if y.dtype != dtypes.uint else None),
 ])
 
-def mem_type(x:UOp) -> str: return 'shared' if x.addrspace == AddrSpace.LOCAL else 'global'
+def mem_type(ctx:"PTXRenderer", x:UOp, st=False) -> str:
+  return 'shared' if x.addrspace == AddrSpace.LOCAL else 'global' + (ctx.cache_opts[ctx.cache.get(x.src[0].buf_uop.arg.slot, 0)][st] or "")
+def mem_load(ctx:"PTXRenderer", x:UOp, loc:UOp) -> str:
+  return f"ld.{mem_type(ctx, loc)}" + \
+    f"{f'.v{x.max_numel()}' if x.max_numel() > 1 else ''}.{ctx.mem_types[x.dtype.scalar()]} {('{' + ', '.join(ctx.r[x]) + '}') if x.max_numel() > 1 else ctx.r[x]}, [{ctx.r[loc]}+0];"
 
 def render_wmma(ctx: "PTXRenderer", wmma: UOp):
   assert ctx.wmma_r, "registry values for wmma must be populated"
@@ -100,19 +104,18 @@ string_rewrite = PatternMatcher([
    f"mov.{'pred' if var.dtype == dtypes.bool else 'b'+ctx.types[var.dtype][1:]} {ctx.r[loc]}, {ctx.r[var]};" \
      if loc.addrspace == AddrSpace.REG else None),
   (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="loc"), UPat.var("var"))),
-   lambda ctx, loc, var: f"st.{mem_type(loc)}" + \
+   lambda ctx, loc, var: f"st.{mem_type(ctx, loc, True)}" + \
     f"{f'.v{cnt}' if ((cnt:=var.max_numel())>1) else ''}.{ctx.mem_types[var.dtype.scalar()]} " + \
     f"[{ctx.r[loc]}+0], {('{' + ', '.join(ctx.r[var]) + '}') if var.max_numel() > 1 else ctx.r[var]};"),
   (UPat(Ops.LOAD, name="x", src=(UPat((Ops.INDEX, Ops.SHRINK), name="loc"), UPat.var("alt"), UPat.var("gate"))),
     lambda ctx, x, loc, alt, gate: flatten([
     [f"mov.{ctx.mem_types[x.dtype.scalar()]} {v}, {render_val(0, x.dtype.scalar())};" for v in ctx.r[x]],
-    [f"@{ctx.r[gate]} ld.{mem_type(loc)}.v{x.max_numel()}.{ctx.mem_types[x.dtype.scalar()]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];"]
+    [f"@{ctx.r[gate]} {mem_load(ctx, x, loc)}"]
   ]) if alt.max_numel() > 1 else [
-    f"@{ctx.r[gate]} ld.{mem_type(loc)}.{ctx.mem_types[x.dtype.scalar()]} {ctx.r[x]}, [{ctx.r[loc]}+0];",
+    f"@{ctx.r[gate]} {mem_load(ctx, x, loc)}",
     f"@!{ctx.r[gate]} mov.b{ctx.types[x.dtype.scalar()][1:]} {ctx.r[x]}, {ctx.r[alt]};"]),
   (UPat(Ops.LOAD, name="x", src=(UPat((Ops.INDEX, Ops.SHRINK), name="loc"),)),
-    lambda ctx, x, loc: f"ld.{mem_type(loc)}.v{x.max_numel()}.{ctx.mem_types[x.dtype.scalar()]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];" \
-     if x.max_numel() > 1 else f"ld.{mem_type(loc)}.{ctx.mem_types[x.dtype]} {ctx.r[x]}, [{ctx.r[loc]}+0];"),
+    lambda ctx, x, loc: mem_load(ctx, x, loc)),
   # simple
   (UPat(Ops.BUFFER, name="x"), lambda ctx, x: [] if x.addrspace == AddrSpace.REG else [
     f".shared .align 16 .b8 local{x.arg.slot}[{x.max_numel()*x.dtype.itemsize}];", f"mov.u64 {ctx.r[x]}, local{x.arg.slot}[0];"]),
@@ -142,6 +145,7 @@ class PTXRenderer(Renderer):
     from tinygrad.runtime.support.compiler_cuda import NVPTXCompiler, PTXCompiler
     self.compiler = (PTXCompiler if target.interface.startswith("MOCK") or target.device == "CUDA" else NVPTXCompiler)(target.arch)
     self.tensor_cores = PTXRenderer.tc_sm80 if (ver:=int(target.arch[3:])) >= 80 else tc.cuda_sm75 if ver >= 75 else []
+    self.cache_opts = ((("", ""), (".L1::evict_last.L2::128B", ".L1::evict_last"), (".L2::64B", ".L1::evict_first"), (".L2::256B", None), (None, ".wt")) if ver >= 80 else (("", ""), (".cg", ".cg"), (".cs", ".cs"), (".nc", None), (None, ".wt")))
 
   # language options
   kernel_prefix = """.version VERSION
@@ -170,6 +174,7 @@ class PTXRenderer(Renderer):
 
     c: defaultdict[str, int] = defaultdict(int)
     r: dict[UOp, list[str]|str] = {}
+    self.cache = {o.axis:o.arg for o in uops[-1].arg.applied_opts if o.op.name == "CACHE"}
     self.r = r
     self.uops = uops
 

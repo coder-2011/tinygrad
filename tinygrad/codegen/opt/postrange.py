@@ -128,6 +128,13 @@ class Scheduler:
       if append_opt: self.applied_opts.append(opt)
       self.dont_use_locals = True
       return
+    if opt.op is OptOps.CACHE:
+      stores = {u.src[0].buf_uop.arg.slot for u in self.ast.backward_slice_with_self if u.op is Ops.STORE and u.src[0].buf_uop.op is Ops.PARAM}
+      check((cache_opts:=getattr(self.ren, "cache_opts", ())) and self.ren.target.interface != "MOCK" and isinstance(opt.arg, int) and 0 < opt.arg < len(cache_opts) and cache_opts[opt.arg][opt.axis in stores] is not None and
+            opt.axis in {u.arg.slot for u in self.ast.backward_slice if u.op is Ops.PARAM and u.arg.slot >= 0} and
+            all(x.op is not OptOps.CACHE or x.axis != opt.axis for x in self.applied_opts), "bad cache hint")
+      if append_opt: self.applied_opts.append(opt)
+      return
 
     if opt.op in {OptOps.LOCAL, OptOps.GROUP, OptOps.GROUPTOP}:
       check(self.ren.has_local, "locals needed for opt")
