@@ -174,7 +174,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
       # done
       opts = sorted(timed, key=lambda x: x[1])
       exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
-      if not exiting: beam = opts[:amt]
+      if not exiting: beam = opts[:amt-1]+nc[:1] if amt > 1 and (nc:=[x for x in opts if x[0].applied_opts[-1].op is not OptOps.CACHE]) and all(x[0].applied_opts[-1].op is OptOps.CACHE for x in opts[:amt]) else opts[:amt]
       elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
       if DEBUG >= 2:
         print(f"\r{time.perf_counter() - st:7.2f}s:", colored(time_to_str(beam[0][1], w=12), "green" if exiting else None),
